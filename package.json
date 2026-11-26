@@ -1,0 +1,32 @@
+{
+  "name": "context-doctor-preview",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "description": "An agent-first diagnostic toolkit for maintaining the accuracy, consistency and integrity of coding agent instructions.",
+  "bin": {
+    "context-doctor": "./dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "skills"
+  ],
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/loueed/context-doctor-preview.git"
+  },
+  "dependencies": {
+    "github-slugger": "2.0.0",
+    "mdast-util-from-markdown": "2.1.0",
+    "mdast-util-frontmatter": "2.0.1",
+    "mdast-util-gfm": "3.1.0",
+    "micromark-extension-frontmatter": "2.0.0",
+    "micromark-extension-gfm": "3.0.0",
+    "semver": "7.8.6",
+    "yaml": "2.9.1"
+  },
+  "engines": {
+    "node": "^22.18.0 || ^24.11.0 || >=26.0.0"
+  }
+}
