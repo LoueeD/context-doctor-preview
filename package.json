@@ -1,12 +1,13 @@
 {
   "name": "context-doctor-preview",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "private": true,
   "description": "An agent-first diagnostic toolkit for maintaining the accuracy, consistency and integrity of coding agent instructions.",
   "bin": {
-    "context-doctor": "./dist/cli.mjs"
+    "context-doctor": "./bin/context-doctor.cjs"
   },
   "files": [
+    "bin",
     "dist",
     "README.md",
     "skills"

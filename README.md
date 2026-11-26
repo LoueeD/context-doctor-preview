@@ -6,14 +6,22 @@ No API keys. No additional inference costs from the tool itself. No infrastructu
 
 Just a new capability for the agent.
 
-**Status** · v0.1.0-alpha.1
+**Status** · v0.1.0-alpha.2
 
 ## Try it in a repository
 
-Use Node.js 22.18+, 24.11+ or 26+ on the supported release lines. Git enables working-tree discovery and changed-path scans. From the repository you want to review, run:
+Run `node --version` in the shell you will use to check your repository. The preview uses the Node.js installation on that shell's PATH. Use Node.js 22.18+, 24.11+ or 26+ on the supported release lines. Git enables working-tree discovery and changed-path scans.
+
+From the repository you want to review, run:
 
 ```sh
-npx 'github:loueed/context-doctor-preview#v0.1.0-alpha.1' scan
+npx 'github:loueed/context-doctor-preview#v0.1.0-alpha.2' scan
+```
+
+If your project uses an older Node.js version, put a supported installation first on PATH for this command. This works even when a project runtime shim selects an older version.
+
+```sh
+PATH="/path/to/node26/bin:$PATH" npx 'github:loueed/context-doctor-preview#v0.1.0-alpha.2' scan
 ```
 
 Use `scan --inventory` for structured findings, document inventory and analysis coverage. To scan another checkout, pass its path after `scan`. A scan is read-only and never executes commands found in repository files. A clean scan means the checks found no reported issues in the selected scope. It does not establish that the guidance is complete or useful.
@@ -23,14 +31,14 @@ Use `scan --inventory` for structured findings, document inventory and analysis 
 Add the [Context Doctor skill](skills/context-doctor/SKILL.md) directory, including its references, to your coding agent. Install the preview CLI so the skill's examples are available as written:
 
 ```sh
-npm install --global 'github:loueed/context-doctor-preview#v0.1.0-alpha.1'
+npm install --global 'github:loueed/context-doctor-preview#v0.1.0-alpha.2'
 ```
 
 Then ask:
 
 > Run Context Doctor and propose fixes.
 
-Without a global install, tell the agent to replace the `context-doctor` prefix in each example with `npx 'github:loueed/context-doctor-preview#v0.1.0-alpha.1'`.
+Without a global install, tell the agent to replace the `context-doctor` prefix in each example with `npx 'github:loueed/context-doctor-preview#v0.1.0-alpha.2'`.
 
 ## Feedback
 
