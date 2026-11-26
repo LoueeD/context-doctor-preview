@@ -9,9 +9,9 @@ import { fromMarkdown } from "mdast-util-from-markdown";
 import { frontmatterFromMarkdown } from "mdast-util-frontmatter";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { frontmatter } from "micromark-extension-frontmatter";
-import { LineCounter, isScalar, isSeq, parseDocument } from "yaml";
+import { LineCounter, isMap, isScalar, isSeq, parseDocument } from "yaml";
 import { gfm } from "micromark-extension-gfm";
-import { intersects, minVersion, satisfies, validRange } from "semver";
+import { intersects, minVersion, satisfies, valid, validRange } from "semver";
 // src/discovery/repository.ts
 const exec = promisify(execFile);
 const instructionNames = [
@@ -36,6 +36,9 @@ function contextConvention(path) {
 	if (/(?:^|\/)\.cursor\/rules\/.*\.mdc$/.test(path) || name === ".cursorrules") return "cursor";
 	if (/(?:^|\/)\.claude\/rules\/.*\.md$/.test(path)) return "claude-rules";
 	return null;
+}
+function isMarkdown(path) {
+	return /\.md(?:own|arkdown)?$/i.test(path);
 }
 const skipped = /* @__PURE__ */ new Set([
 	".git",
@@ -80,39 +83,71 @@ async function openRepository(cwd, requestedPath) {
 		isGit: Boolean(gitRoot)
 	};
 }
-async function findOnDisk(path, includeOther) {
+async function findOnDisk(path, matchesFile) {
 	if (!(await stat(path)).isDirectory()) return [path];
 	const matches = [];
 	for (const entry of await readdir(path, { withFileTypes: true })) {
 		if (skipped.has(entry.name)) continue;
 		const child = resolve(path, entry.name);
-		if (entry.isDirectory()) matches.push(...await findOnDisk(child, includeOther));
-		else if (entry.isFile() && (instructionNames.includes(entry.name) || includeOther && contextConvention(child.split(sep).join("/")))) matches.push(child);
+		if (entry.isDirectory()) matches.push(...await findOnDisk(child, matchesFile));
+		else if (entry.isFile() && matchesFile(child, entry.name)) matches.push(child);
 	}
 	return matches;
 }
-async function discover(repository, includeOther = false) {
-	const { root, scope, isGit } = repository;
-	if ((await stat(scope)).isFile()) {
-		if (!/\.md(?:own|arkdown)?$/i.test(scope)) throw new Error("--path must be a directory or Markdown file");
-		return {
-			selected: [scope],
-			other: []
-		};
-	}
-	const paths = !isGit ? (await findOnDisk(scope, includeOther)).sort() : [...new Set((await git(root, [
+async function workingPaths(root, patterns) {
+	const output = await git(root, [
 		"ls-files",
 		"-z",
 		"--cached",
 		"--others",
 		"--exclude-standard",
 		"--",
-		...instructionNames.map((name) => ":(glob)**/" + name),
-		...includeOther ? additionalPatterns.map((pattern) => ":(glob)" + pattern) : []
-	])).split("\0").filter(Boolean).map((path) => resolve(root, path)))].filter((path) => within(scope, path)).sort();
+		...patterns.map((pattern) => ":(glob)" + pattern)
+	]);
+	return [...new Set(output.split("\0").filter(Boolean))].sort();
+}
+async function packageManifestPaths(repository) {
+	const { root } = repository;
+	return (repository.isGit ? await workingPaths(root, ["**/package.json"]) : (await findOnDisk(root, (_, name) => name === "package.json")).map((path) => displayPath(root, path))).filter((path) => !path.split("/").some((segment) => skipped.has(segment))).sort();
+}
+async function explicitEntry(repository, requested) {
+	const path = resolve(repository.root, requested);
+	if (!isMarkdown(path) || !within(repository.scope, path)) throw new Error("--entry must name a Markdown file within the scan scope (" + requested + ")");
+	const target = await realpath(path).catch((error) => {
+		if (error.code === "ENOENT" || error.code === "ENOTDIR") throw new Error("--entry file was not found (" + requested + ")");
+		throw error;
+	});
+	if (!isMarkdown(target) || !within(repository.scope, target) || !(await stat(target)).isFile()) throw new Error("--entry must resolve to a Markdown file within the scan scope (" + requested + ")");
+	return path;
+}
+async function discover(repository, { inventory, includeObserved, entries = [] }) {
+	const { root, scope, isGit } = repository;
+	const selected = /* @__PURE__ */ new Map();
+	if ((await stat(scope)).isFile()) {
+		if (!isMarkdown(scope)) throw new Error("--path must be a directory or Markdown file");
+		if (includeObserved || entries.length) throw new Error("--include-observed and --entry require a directory scan scope");
+		selected.set(scope, "explicit-file");
+		return {
+			selected,
+			other: []
+		};
+	}
+	const includeOther = Boolean(inventory || includeObserved);
+	const explicit = /* @__PURE__ */ new Set();
+	for (const entry of entries) explicit.add(await explicitEntry(repository, entry));
+	const paths = !isGit ? (await findOnDisk(scope, (path, name) => instructionNames.includes(name) || includeOther && contextConvention(displayPath(root, path)) !== null)).sort() : (await workingPaths(root, [...instructionNames.map((name) => "**/" + name), ...includeOther ? additionalPatterns : []])).map((path) => resolve(root, path)).filter((path) => within(scope, path)).sort();
+	const other = [];
+	for (const path of paths) if (instructionNames.includes(posix.basename(displayPath(root, path)))) selected.set(path, "default-entry");
+	else if (includeObserved && isMarkdown(path)) selected.set(path, "included-convention");
+	else if (!explicit.has(path)) other.push(path);
+	for (const path of [...explicit].sort()) selected.set(path, "explicit-file");
 	return {
-		selected: paths.filter((path) => instructionNames.includes(posix.basename(displayPath(root, path)))),
-		other: paths.filter((path) => !instructionNames.includes(posix.basename(displayPath(root, path))))
+		selected,
+		other,
+		selection: includeObserved || explicit.size ? {
+			includeObserved: Boolean(includeObserved),
+			entries: [...explicit].map((path) => displayPath(root, path)).sort()
+		} : void 0
 	};
 }
 async function isIgnored(repository, path) {
@@ -294,7 +329,7 @@ var WorkingTree = class {
 		const contents = await this.read(path);
 		if (contents === null) return null;
 		try {
-			const value = JSON.parse(contents);
+			const value = JSON.parse(contents.replace(/^\uFEFF/, ""));
 			if (!isRecord(value)) return {
 				path,
 				data: null,
@@ -334,9 +369,6 @@ const configName = /^(?:\.(?:nvmrc|node-version|npmrc|gitignore|env(?:\.[\w-]+)?
 function isConfiguration(reference) {
 	return configName.test(basename(reference.replace(/\/$/, "")));
 }
-function isMarkdown(path) {
-	return /\.md(?:own|arkdown)?$/i.test(path);
-}
 // src/analysis/compare.ts
 const snapshotError = "Expected a complete, unfiltered scan --inventory --all JSON report";
 async function snapshot(path) {
@@ -347,7 +379,7 @@ async function snapshot(path) {
 	} catch {
 		throw new Error("Invalid JSON report at " + path);
 	}
-	if (!isRecord(report) || report.schemaVersion !== 1 || !isRecord(report.scope) || typeof report.scope.path !== "string" || report.scope.changed !== false || !isRecord(report.page) || report.page.offset !== 0 || report.page.limit !== null || report.page.nextOffset !== null || !isRecord(report.summary) || !Array.isArray(report.findings) || report.summary.total !== report.findings.length || !isRecord(report.inventory) || report.inventory.snapshotVersion !== 1 || report.inventory.minimumSeverity !== "warning" || typeof report.inventory.checkoutId !== "string" || !Array.isArray(report.inventory.documents)) throw new Error(snapshotError);
+	if (!isRecord(report) || report.schemaVersion !== 1 || !isRecord(report.scope) || typeof report.scope.path !== "string" || report.scope.changed !== false || report.scope.selection !== void 0 && (!isRecord(report.scope.selection) || typeof report.scope.selection.includeObserved !== "boolean" || !Array.isArray(report.scope.selection.entries) || !report.scope.selection.entries.every((entry) => typeof entry === "string")) || !isRecord(report.page) || report.page.offset !== 0 || report.page.limit !== null || report.page.nextOffset !== null || !isRecord(report.summary) || !Array.isArray(report.findings) || report.summary.total !== report.findings.length || !isRecord(report.inventory) || report.inventory.snapshotVersion !== 1 || report.inventory.minimumSeverity !== "warning" || typeof report.inventory.checkoutId !== "string" || !Array.isArray(report.inventory.documents)) throw new Error(snapshotError);
 	for (const finding of report.findings) if (!isRecord(finding) || typeof finding.rule !== "string" || typeof finding.checkKey !== "string" || !isRecord(finding.source) || typeof finding.source.file !== "string" || !isRecord(finding.evidence)) throw new Error(snapshotError);
 	for (const document of report.inventory.documents) if (!isRecord(document) || typeof document.path !== "string" || ![
 		"analysed",
@@ -386,6 +418,7 @@ function groups(findings) {
 async function compareReports(beforePath, afterPath) {
 	const [before, after] = await Promise.all([snapshot(beforePath), snapshot(afterPath)]);
 	if (before.scope.path !== after.scope.path || before.inventory.discovery !== after.inventory.discovery || before.inventory.checkoutId !== after.inventory.checkoutId) throw new Error("Snapshots must use the same checkout, discovery method and scan scope");
+	if (JSON.stringify(canonical(before.scope.selection)) !== JSON.stringify(canonical(after.scope.selection))) throw new Error("Snapshots must use the same --entry files and --include-observed setting");
 	const beforeDocs = new Map(before.inventory.documents.map((document) => [document.path, document]));
 	const afterDocs = new Map(after.inventory.documents.map((document) => [document.path, document]));
 	const oldGroups = groups(before.findings);
@@ -490,14 +523,18 @@ function digest(value) {
 	return createHash("sha256").update(value).digest("hex");
 }
 function referenceKey(reference) {
-	return digest(JSON.stringify([
+	const fields = [
 		reference.kind,
 		reference.value,
 		reference.npmPrefix,
 		reference.claim,
 		reference.packageLabel,
 		reference.packageRow?.label
-	]));
+	];
+	if (reference.workingDirectory !== void 0 || reference.shorthand !== void 0) fields.push(reference.workingDirectory, reference.shorthand);
+	if (reference.version !== void 0) fields.push(reference.version);
+	if (reference.workspace) fields.push(reference.workspace.manager, reference.workspace.name);
+	return digest(JSON.stringify(fields));
 }
 function note(document, { reason, ...example }) {
 	const entry = document.limitations[reason] ?? {
@@ -510,7 +547,13 @@ function note(document, { reason, ...example }) {
 }
 // src/parsers/script-command.ts
 const scriptName = /^[a-z0-9_][\w:.-]*$/i;
-const otherManager = /^(?:\$\s+)?(?:pnpm|yarn|bun|vp)\s+run\s+([a-z0-9_][\w:.-]*)(?=$|\s|[;&|])/i;
+const otherManager = /^(?:pnpm|yarn|bun|vp)\s+run\s+([a-z0-9_][\w:.-]*)(?=$|\s|[;&|])/i;
+const shorthandTask = /^(?:pnpm|yarn)\s+(?:build|lint|test|typecheck)(?:[-:][a-z0-9_][\w:.-]*)?(?=$|\s|[;&|])/;
+const workspaceTask = /^(?:(?:build|check|lint|test|typecheck)(?:[-:][a-z0-9_][\w:.-]*)?|prepublishOnly)$/;
+const workspaceName = /^(?:@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i;
+const assignments = /^(?:[A-Za-z_][\w]*=[A-Za-z0-9_./:-]*[ \t]+)+/;
+const changeDirectory = /^cd[ \t]+(?:"([^"\n]+)"|'([^'\n]+)'|([^\s]+))[ \t]*&&[ \t]*/;
+const literalPath = /^[\p{L}\p{N}_. /-]+$/u;
 const word = /(?:'[^']*'|"[^"]*"|[^\s'"|;&<>()\\])+/y;
 function words(command) {
 	const tokens = [];
@@ -528,11 +571,51 @@ function words(command) {
 	}
 	return tokens;
 }
+function workspaceCommand(invocation) {
+	if (!/^(?:yarn\s+workspace\s|pnpm\s+(?:--filter[=\s]|-F\s))/.test(invocation)) return null;
+	const [manager, selector, ...args] = words(invocation) ?? [];
+	const target = selector?.startsWith("--filter=") ? selector.slice(9) : args.shift();
+	const run = args[0] === "run" || manager === "pnpm" && args[0] === "run-script";
+	const name = args[run ? 1 : 0];
+	if (manager !== "pnpm" && manager !== "yarn" || !target || !workspaceName.test(target) || target.includes("...") || !name || !(run ? scriptName : workspaceTask).test(name) || args.slice(run ? 2 : 1).some((argument) => /^(?:-F|--filter(?:-prod)?|--if-present)(?:=|$)/.test(argument))) return null;
+	return {
+		name,
+		workspace: {
+			manager,
+			name: target
+		},
+		...!run ? { shorthand: manager } : {}
+	};
+}
 function scriptCommand(command) {
-	const other = otherManager.exec(command);
-	if (other) return { name: other[1] };
-	if (!/^(?:\$\s+)?npm(?=\s)/.test(command)) return null;
-	const tokens = words(command)?.slice(1);
+	let invocation = command.trimStart().replace(/^\$\s+/, "").replace(assignments, "");
+	const directory = changeDirectory.exec(invocation);
+	const workingDirectory = directory?.[1] ?? directory?.[2] ?? directory?.[3];
+	if (directory && workingDirectory) {
+		if (!literalPath.test(workingDirectory) || /^[/ -]/.test(workingDirectory)) return null;
+		invocation = invocation.slice(directory[0].length).replace(assignments, "");
+	}
+	if (!workingDirectory) {
+		const workspace = workspaceCommand(invocation);
+		if (workspace) return workspace;
+	}
+	const scope = workingDirectory === void 0 ? {} : { workingDirectory };
+	const other = otherManager.exec(invocation);
+	if (other) return {
+		name: other[1],
+		...scope
+	};
+	const shorthand = shorthandTask.exec(invocation);
+	if (shorthand) {
+		const [manager, name] = shorthand[0].split(/\s+/);
+		return {
+			name,
+			shorthand: manager === "pnpm" ? "pnpm" : "yarn",
+			...scope
+		};
+	}
+	if (!/^npm(?=\s)/.test(invocation)) return null;
+	const tokens = words(invocation)?.slice(1);
 	if (!tokens) return null;
 	let name;
 	let npmPrefix;
@@ -541,9 +624,9 @@ function scriptCommand(command) {
 		if (token === "--") break;
 		if (/^(?:-w|--workspaces?|--include-workspace-root|-g|--global)(?:=|$)/.test(token)) return null;
 		if (token === "--prefix" || token.startsWith("--prefix=")) {
-			if (npmPrefix !== void 0) return null;
+			if (npmPrefix !== void 0 || workingDirectory !== void 0) return null;
 			npmPrefix = token === "--prefix" ? tokens[++index] : token.slice(9);
-			if (!npmPrefix || !/^[\p{L}\p{N}_. /-]+$/u.test(npmPrefix) || npmPrefix.startsWith("-")) return null;
+			if (!npmPrefix || !literalPath.test(npmPrefix) || npmPrefix.startsWith("-")) return null;
 		} else if (name === void 0) {
 			if (token === "run" || token === "run-script") name = tokens[++index];
 			else if (token === "test") name = token;
@@ -553,8 +636,12 @@ function scriptCommand(command) {
 	}
 	return name ? {
 		name,
+		...scope,
 		...npmPrefix === void 0 ? {} : { npmPrefix }
 	} : null;
+}
+function looksLikePackageCommand(value) {
+	return /(?:^|&&[ \t]+|=[^\s]*[ \t]+)(?:\$[ \t]+)?(?:npm|pnpm|yarn|bun|vp)[ \t]+/.test(value.trimStart());
 }
 function mutatingLintFlag(command) {
 	const wordsInCommand = words(command);
@@ -579,6 +666,9 @@ function headingText(node) {
 	return "";
 }
 const shell = /^(?:sh|shell|bash|zsh|console|shell-session)$/i;
+const packageManagerLabel = /^(?:\*\*|__)?(?:required[ \t]+)?package[ -]manager(?:\*\*|__)?[ \t]*:[ \t]*`?(?<manager>npm|pnpm|yarn|bun)(?:(?:@|[ \t]+)v?(?<version>\d+\.\d+\.\d+(?:-[\w.-]+)?))?`?(?:[ \t]+\(required\))?\.?[ \t]*$/di;
+const packageManagerDirective = /^(?:always[ \t]+)?use[ \t]+`?(?<manager>npm|pnpm|yarn|bun)`?[ \t]+for[ \t]+(?:package|dependency) management\.?[ \t]*$/di;
+const packageManagerRequirement = /(?:^|[.!?][ \t]+)(?:the[ \t]+)?package manager(?: used to install and link dependencies)? must be[ \t]+`?\[?(?<manager>npm|pnpm|yarn|bun)(?:\]\([^\n)]+\)|`)?(?=\.(?:\s|$)|$)/di;
 const dependency$1 = /^(?:@[a-z0-9._-]+\/)?[a-z0-9][a-z0-9._-]*$/i;
 const nodeVersion = /\bnode(?:\.js)?[ \t]+(v?\d+(?:\.\d+){0,2})(?![\dA-Za-z/+-]|\.\w|\s*(?:\bor\b|\bthrough\b|\bto\b|\band\s+(?:above|later|newer)\b|[,/]\s*v?\d))/gi;
 const nodeMinimum$1 = /\bnode(?:\.js)?[ \t]+(v?\d+(?:\.\d+){0,2})\+(?!\w|\.\d)/gi;
@@ -645,6 +735,22 @@ function parseMarkdown(contents, inventory = false) {
 				column
 			});
 		};
+		if (node.type === "paragraph") {
+			const paragraph = contents.slice(start.offset, node.position?.end.offset).trimEnd();
+			const requirement = packageManagerLabel.exec(paragraph) ?? packageManagerDirective.exec(paragraph) ?? packageManagerRequirement.exec(paragraph);
+			const managerStart = requirement?.indices?.groups?.manager?.[0];
+			if (requirement?.groups?.manager && managerStart !== void 0) {
+				const { manager, version } = requirement.groups;
+				const preceding = paragraph.slice(0, managerStart).split(/\r\n|\r|\n/);
+				references.push({
+					kind: "package-manager",
+					value: manager.toLowerCase(),
+					...version ? { version } : {},
+					line: start.line + preceding.length - 1,
+					column: (preceding.length === 1 ? start.column : 1) + (preceding.at(-1)?.length ?? 0)
+				});
+			}
+		}
 		if (node.type === "yaml") {
 			const lineCounter = new LineCounter();
 			const metadata = parseDocument(node.value, { lineCounter });
@@ -670,10 +776,9 @@ function parseMarkdown(contents, inventory = false) {
 			reason: "toml-frontmatter-uninterpreted",
 			line: start.line
 		});
-		const addScript = (value, line, column) => {
-			const command = scriptCommand(value);
+		const addScript = (value, line, column, command = scriptCommand(value), example = false) => {
 			if (!command) {
-				if (inventory && /^(?:\$[ \t]+)?(?:npm|pnpm|yarn|bun|vp)[ \t]+/.test(value)) notices.push({
+				if (inventory && looksLikePackageCommand(value)) notices.push({
 					reason: "package-command-outside-script-parser",
 					line
 				});
@@ -683,11 +788,13 @@ function parseMarkdown(contents, inventory = false) {
 				line: row.position.start.line,
 				label: headingText(row.children[0]).trim()
 			} : void 0;
+			const { name, ...invocation } = command;
 			references.push({
-				kind: "script",
+				kind: invocation.workspace ? "workspace-script" : "script",
+				value: name,
+				...invocation,
+				...invocation.workspace && example ? { workspaceExample: true } : {},
 				packageRow,
-				value: command.name,
-				npmPrefix: command.npmPrefix,
 				line,
 				column
 			});
@@ -698,23 +805,31 @@ function parseMarkdown(contents, inventory = false) {
 			const url = definitions.get(node.identifier);
 			if (url) add("link", url);
 		}
-		if (node.type === "code" && shell.test(node.lang ?? "") && !/\bexample\b/i.test(node.meta ?? "")) node.value.split("\n").forEach((line, index) => {
-			addScript(line.trimStart(), start.line + index + 1, line.length - line.trimStart().length + 1);
-		});
+		if (node.type === "code" && shell.test(node.lang ?? "") && !/\bexample\b/i.test(node.meta ?? "")) {
+			const introduction = previous?.type === "paragraph" ? headingText(previous).trim() : "";
+			const example = introduction.endsWith(":") && /^(?:examples?\s*:|for example\b)/i.test(introduction);
+			node.value.split("\n").forEach((line, index) => {
+				addScript(line.trimStart(), start.line + index + 1, line.length - line.trimStart().length + 1, void 0, example);
+			});
+		}
 		if (node.type === "inlineCode") {
 			const prefix = previous?.type === "text" ? previous.value : "";
 			const suffix = next?.type === "text" ? next.value : "";
 			const claim = /^\s+is\s+(non-mutating|read-only)\b/i.exec(suffix)?.[1];
 			const command = scriptCommand(node.value);
-			if (claim && (command || /^[a-z0-9_][\w:.-]*$/i.test(node.value))) references.push({
-				kind: "script-claim",
-				value: command?.name ?? node.value,
-				npmPrefix: command?.npmPrefix,
-				claim,
-				line: start.line,
-				column: start.column
-			});
-			if (addScript(node.value, start.line, start.column)) return;
+			if (claim && !command?.workspace && (command || /^[a-z0-9_][\w:.-]*$/i.test(node.value))) {
+				const { name = node.value, ...invocation } = command ?? {};
+				references.push({
+					kind: "script-claim",
+					value: name,
+					...invocation,
+					claim,
+					line: start.line,
+					column: start.column
+				});
+			}
+			const example = /\b(?:for example|e\.g\.)[, \t]*$/i.test(prefix);
+			if (addScript(node.value, start.line, start.column, command, example)) return;
 			if (dependency$1.test(node.value) && (/\bdependenc(?:y|ies):\s*$/i.test(prefix) || /\brequires?\s+(?:the\s+)?$/i.test(prefix) && /^\s+package\b/i.test(suffix))) add("dependency", node.value);
 			else if (versionOnly.test(node.value) && /\bnode(?:\.js)?[ \t]+$/i.test(prefix) && !/^\s*(?:\+|or\b|through\b|to\b|and\s+(?:above|later|newer)\b|[,/]\s*v?\d)/i.test(suffix)) add("node", node.value);
 			else if (looksLikePath(node.value) && !/\b(?:creates?|generates?|writes?|auto-adds?)\s+(?:(?:an?|the)\s+)?(?:empty\s+)?$/i.test(prefix) && !/^\s+is\s+generated\b/i.test(suffix)) add("path", node.value);
@@ -747,7 +862,12 @@ function parseMarkdown(contents, inventory = false) {
 		for (const reference of references) count(values, JSON.stringify([
 			reference.kind,
 			reference.value,
-			reference.npmPrefix
+			reference.npmPrefix,
+			reference.workingDirectory,
+			reference.shorthand,
+			reference.version,
+			reference.workspace?.manager,
+			reference.workspace?.name
 		]), reference.line);
 		measurements = {
 			bytes: Buffer.byteLength(contents),
@@ -764,6 +884,171 @@ function parseMarkdown(contents, inventory = false) {
 		historical,
 		notices,
 		measurements
+	};
+}
+// src/resolvers/workspace.ts
+function parsePatterns(entries) {
+	if (!Array.isArray(entries)) return void 0;
+	const patterns = [];
+	for (const entry of entries) {
+		if (typeof entry !== "string") return void 0;
+		const exclude = entry.startsWith("!");
+		const name = entry.slice(Number(exclude)).replace(/^\.\//, "").replace(/\/$/, "");
+		const segments = name === "." ? [] : name.split("/");
+		if (!segments.every((segment) => segment !== "." && segment !== ".." && /^(?:\*{1,2}|[\p{L}\p{N}_.@+-]+)$/u.test(segment))) return void 0;
+		patterns.push({
+			exclude,
+			segments
+		});
+	}
+	return patterns;
+}
+function matches(pattern, directory) {
+	let positions = /* @__PURE__ */ new Set([0]);
+	for (const segment of pattern) {
+		if (segment === "**") for (const position of positions) {
+			const next = directory[position];
+			if (next && !next.startsWith(".")) positions.add(position + 1);
+		}
+		else positions = new Set([...positions].filter((position) => {
+			const next = directory[position];
+			return next === segment || segment === "*" && next && !next.startsWith(".");
+		}).map((position) => position + 1));
+		if (!positions.size) return false;
+	}
+	return positions.has(directory.length);
+}
+async function pnpmDefinition(tree, directory) {
+	const path = resolve(directory, "pnpm-workspace.yaml");
+	if (!await tree.locate(path)) return null;
+	const input = await tree.read(path);
+	if (input === null) return {
+		path,
+		issue: "workspace-definition-unavailable"
+	};
+	const parsed = parseDocument(input);
+	if (parsed.errors.length || !isMap(parsed.contents)) return {
+		path,
+		issue: "workspace-definition-invalid"
+	};
+	const packages = parsed.get("packages", true);
+	if (packages === void 0) return {
+		path,
+		patterns: []
+	};
+	if (!isSeq(packages)) return {
+		path,
+		issue: "workspace-definition-invalid"
+	};
+	const entries = packages.items.map((entry) => isScalar(entry) ? entry.value : void 0);
+	if (entries.some((entry) => typeof entry !== "string")) return {
+		path,
+		issue: "workspace-definition-invalid"
+	};
+	const patterns = parsePatterns(entries);
+	return patterns ? {
+		path,
+		patterns
+	} : {
+		path,
+		issue: "workspace-pattern-unsupported"
+	};
+}
+async function yarnDefinition(tree, directory) {
+	const path = resolve(directory, "package.json");
+	const location = await tree.locate(path);
+	if (!location) return null;
+	if (location.kind !== "file") return {
+		path,
+		issue: "workspace-definition-unavailable"
+	};
+	const manifest = await tree.manifestAt(directory);
+	if (!manifest?.data) return {
+		path,
+		issue: "workspace-definition-invalid"
+	};
+	const { workspaces } = manifest.data;
+	if (workspaces === void 0) return null;
+	const patterns = parsePatterns(isRecord(workspaces) ? workspaces.packages : workspaces);
+	return patterns ? {
+		path: manifest.path,
+		patterns
+	} : {
+		path: manifest.path,
+		issue: "workspace-pattern-unsupported"
+	};
+}
+function workspaceResolver(tree, discoverManifests) {
+	const definitions = /* @__PURE__ */ new Map();
+	const members = /* @__PURE__ */ new Map();
+	let manifestPaths;
+	async function inspectMembers(definition, manager) {
+		const workspace = dirname(definition.path);
+		const { patterns } = definition;
+		const includes = (relative) => {
+			const manifest = resolve(tree.root, relative);
+			const directory = dirname(manifest);
+			if (!within(workspace, directory)) return false;
+			if (directory === workspace) return manager === "pnpm";
+			const segments = displayPath(workspace, directory).split("/");
+			return patterns.some((pattern) => !pattern.exclude && matches(pattern.segments, segments)) && !patterns.some((pattern) => pattern.exclude && matches(pattern.segments, segments));
+		};
+		manifestPaths ??= discoverManifests();
+		const paths = (await manifestPaths).filter(includes);
+		const manifests = [];
+		let incomplete = false;
+		for (const relative of paths) {
+			const path = resolve(tree.root, relative);
+			const location = await tree.locate(path);
+			if (!location) continue;
+			if (location.kind !== "file" || !within(workspace, location.path)) {
+				incomplete = true;
+				continue;
+			}
+			const manifest = await tree.manifestAt(dirname(path));
+			if (manifest?.data) manifests.push(manifest);
+			else incomplete = true;
+		}
+		return {
+			manifests,
+			incomplete
+		};
+	}
+	return async (file, selector) => {
+		const { manager, name } = selector;
+		let definition = null;
+		for (const directory of tree.ancestors(file)) {
+			const key = JSON.stringify([manager, directory]);
+			let cached = definitions.get(key);
+			if (!cached) {
+				cached = manager === "pnpm" ? pnpmDefinition(tree, directory) : yarnDefinition(tree, directory);
+				definitions.set(key, cached);
+			}
+			definition = await cached;
+			if (definition) break;
+		}
+		if (!definition) return { issue: "workspace-definition-missing" };
+		if ("issue" in definition) return {
+			issue: definition.issue,
+			path: definition.path
+		};
+		let cached = members.get(definition.path);
+		if (!cached) {
+			cached = inspectMembers(definition, manager);
+			members.set(definition.path, cached);
+		}
+		const { manifests, incomplete } = await cached;
+		let matches = manifests.filter((manifest) => manifest.data?.name === name);
+		if (!matches.length && manager === "pnpm" && !name.startsWith("@")) matches = manifests.filter(({ data }) => typeof data?.name === "string" && data.name.startsWith("@") && data.name.split("/").at(-1) === name);
+		if (incomplete && matches.length < 2) return {
+			issue: "workspace-manifests-incomplete",
+			path: definition.path
+		};
+		return {
+			definition: definition.path,
+			matches,
+			inspectedCount: manifests.length
+		};
 	};
 }
 // src/rules/index.ts
@@ -810,7 +1095,7 @@ const path = {
 	severity: "warning",
 	description: "Check inline code that looks like a repository file, directory, or configuration path.",
 	guidance: "Check whether the reference is illustrative, generated, renamed, or removed. Confirm the intended location before editing.",
-	async check(reference, { file, tree, pathCandidates, packageCandidates, isIgnored, skip }) {
+	async check(reference, { file, tree, pathCandidates, packageCandidates, isIgnored, indexedPath, skip }) {
 		const target = localTarget(file, tree.root, reference.value, false);
 		if (!target) return skip("path-outside-local-resolution");
 		const explicit = reference.value.startsWith("./") || reference.value.startsWith("../");
@@ -821,6 +1106,31 @@ const path = {
 		if (entries.some((entry) => entry && entry.kind !== "other" && (!expectsDirectory || entry.kind === "directory"))) return null;
 		const other = entries.find((entry) => entry?.kind === "other");
 		if (other) return skip("path-target-unavailable", other.path);
+		if (!config && !reference.value.includes("/") && isMarkdown(reference.value)) {
+			const scoped = await indexedPath(reference.value, reference.line, reference.column);
+			if (scoped) {
+				const entry = await tree.locate(scoped.path);
+				if (entry?.kind === "file") return null;
+				if (entry?.kind === "other") return skip("path-target-unavailable", scoped.path);
+				const location = displayPath(tree.root, scoped.path);
+				const index = displayPath(tree.root, scoped.index);
+				return {
+					confidence: "medium",
+					paths: [location, index],
+					evidence: {
+						reference: reference.value,
+						resolvedPath: location,
+						exists: Boolean(entry),
+						documentIndex: index,
+						documentIndexReferenceLine: scoped.line,
+						...entry ? {
+							expectedKind: "file",
+							actualKind: entry.kind
+						} : {}
+					}
+				};
+			}
+		}
 		if (entries.every((entry) => !entry) && !explicit) {
 			const [name, ...segments] = reference.value.split("/");
 			if (["node_modules/", "dist/"].includes(reference.value) && await isIgnored(reference.value)) return skip("git-ignored-generated-directory");
@@ -851,42 +1161,98 @@ const path = {
 		};
 	}
 };
-async function scriptManifests(tree, file, prefix) {
+async function scriptManifests(tree, file, { npmPrefix, workingDirectory }) {
+	const prefix = npmPrefix ?? workingDirectory;
 	const directories = prefix === void 0 ? [...tree.ancestors(file)] : [.../* @__PURE__ */ new Set([resolve(tree.root, prefix), resolve(dirname(file), prefix)])].filter((path) => within(tree.root, path));
 	return {
 		manifests: (prefix === void 0 ? [await tree.manifest(file)] : await Promise.all(directories.map((path) => tree.manifestAt(path)))).filter((manifest) => manifest !== null),
 		paths: directories.map((path) => displayPath(tree.root, resolve(path, "package.json")))
 	};
 }
+const dependencySections = [
+	"dependencies",
+	"devDependencies",
+	"optionalDependencies",
+	"peerDependencies"
+];
+async function hasExecutableEvidence(tree, manifest, name) {
+	for (const directory of tree.ancestors(manifest.path)) {
+		const candidate = await tree.manifestAt(directory);
+		if (dependencySections.some((section) => Object.keys(candidate?.data?.[section] ?? {}).some((dependency) => dependency.split("/").at(-1) === name))) return true;
+		if (!name.includes(":")) {
+			const bin = resolve(directory, "node_modules", ".bin", name);
+			if (await tree.locate(bin)) return true;
+			if (process.platform === "win32" && await tree.locate(bin + ".cmd")) return true;
+		}
+	}
+	return false;
+}
 const unknownScriptScope = {
 	id: "script-scope-unknown",
 	alias: "CD006",
 	severity: "warning",
 	description: "Identify script commands whose owning package could not be established.",
-	guidance: "Identify the intended working directory or add an explicit npm prefix before validating this script."
+	guidance: "Identify the intended working directory before validating this script."
 };
+const unresolvedShorthand = {
+	id: "script-shorthand-unresolved",
+	alias: "CD010",
+	severity: "warning",
+	description: "Identify a Yarn or pnpm task shorthand that is absent from the selected manifest.",
+	guidance: "Check whether the shorthand is meant to run a package script or an executable provided by the package manager."
+};
+async function checkManifestScript(reference, { tree, skip }, manifest, evidence, relatedPaths = []) {
+	const scripts = Object.keys(manifest.data?.scripts ?? {}).sort();
+	if (scripts.includes(reference.value)) return null;
+	const { shorthand, workspace } = reference;
+	const isYarn = shorthand === "yarn" || workspace?.manager === "yarn";
+	if (isYarn && reference.value.includes(":")) return skip("yarn-workspace-script-unchecked", manifest.path);
+	if (workspace?.manager === "yarn" && reference.value === "env") return skip("yarn-command-outside-script-check", manifest.path);
+	if ((shorthand || isYarn) && await hasExecutableEvidence(tree, manifest, reference.value)) return skip("shorthand-executable-candidate", manifest.path);
+	const manifestPath = displayPath(tree.root, manifest.path);
+	return {
+		paths: [manifestPath, ...relatedPaths],
+		...shorthand ? {
+			confidence: "medium",
+			diagnostic: unresolvedShorthand
+		} : {},
+		evidence: {
+			...evidence,
+			manifest: manifestPath,
+			defined: false,
+			availableScripts: scripts.slice(0, 15),
+			availableScriptCount: scripts.length
+		}
+	};
+}
 const script = {
 	id: "script-not-defined",
 	alias: "CD003",
 	kind: "script",
 	severity: "error",
-	description: "Check script commands against the package selected by an explicit npm prefix or the nearest package.json.",
+	description: "Check script commands against the selected package manifest.",
 	guidance: "Inspect the package and instructions to confirm which script or working directory the author intended.",
 	async check(reference, { file, tree, packageCandidates, skip, inventory }) {
-		const prefix = reference.npmPrefix;
-		const { manifests, paths } = await scriptManifests(tree, file, prefix);
+		const { npmPrefix, workingDirectory, shorthand } = reference;
+		const { manifests, paths } = await scriptManifests(tree, file, reference);
 		if (!paths.length) return skip("script-prefix-outside-repository");
 		const evidence = {
 			script: reference.value,
-			...prefix === void 0 ? {} : { npmPrefix: prefix },
+			...npmPrefix === void 0 ? {} : { npmPrefix },
+			...workingDirectory === void 0 ? {} : { workingDirectory },
+			...shorthand === void 0 ? {} : {
+				packageManager: shorthand,
+				commandForm: "shorthand"
+			},
 			...inventory ? {
-				manifestStrategy: prefix === void 0 ? "nearest-ancestor" : "literal-prefix",
+				manifestStrategy: workingDirectory !== void 0 ? "literal-working-directory" : npmPrefix !== void 0 ? "literal-prefix" : "nearest-ancestor",
 				searchedManifests: paths
 			} : {}
 		};
 		if (manifests.length !== 1 || !manifests[0].data) {
 			const invalid = manifests.find((manifest) => manifest.issue);
 			skip(invalid?.issue ? "manifest-" + invalid.issue : manifests.length ? "manifest-ambiguous" : "manifest-missing", invalid?.path);
+			if (shorthand) return null;
 			return {
 				paths,
 				confidence: "medium",
@@ -895,286 +1261,466 @@ const script = {
 					...evidence,
 					manifest: null,
 					checkedManifests: paths,
-					candidateManifests: manifests.length ? manifests.map(({ path }) => displayPath(tree.root, path)) : prefix === void 0 && reference.packageRow ? await packageCandidates(reference.packageRow.label) : []
+					candidateManifests: manifests.length ? manifests.map(({ path }) => displayPath(tree.root, path)) : npmPrefix === void 0 && workingDirectory === void 0 && reference.packageRow ? await packageCandidates(reference.packageRow.label) : []
 				}
 			};
 		}
-		const [manifest] = manifests;
-		const scripts = Object.keys(manifest.data?.scripts ?? {}).sort();
-		if (scripts.includes(reference.value)) return null;
-		const manifestPath = displayPath(tree.root, manifest.path);
+		return checkManifestScript(reference, {
+			tree,
+			skip
+		}, manifests[0], evidence);
+	}
+};
+const workspaceScript = {
+	id: "workspace-target-unresolved",
+	alias: "CD013",
+	kind: "workspace-script",
+	severity: "warning",
+	description: "Check whether a named pnpm or Yarn target resolves to one declared workspace.",
+	guidance: "Verify the package name and membership in the workspace declared by the repository.",
+	async check(reference, { file, tree, resolveWorkspace, skip }) {
+		const selector = reference.workspace;
+		if (!selector) return null;
+		const result = await resolveWorkspace(file, selector);
+		if ("issue" in result) return skip(result.issue, result.path);
+		const definition = displayPath(tree.root, result.definition);
+		const evidence = {
+			script: reference.value,
+			packageManager: selector.manager,
+			workspace: selector.name,
+			workspaceDefinition: definition,
+			manifestStrategy: "named-workspace",
+			commandForm: reference.shorthand ? "shorthand" : "run"
+		};
+		if (result.matches.length === 1) {
+			const finding = await checkManifestScript(reference, {
+				tree,
+				skip
+			}, result.matches[0], evidence, [definition]);
+			return finding ? {
+				...finding,
+				diagnostic: finding.diagnostic ?? script
+			} : null;
+		}
+		if (reference.workspaceExample) return skip("illustrative-workspace-target", result.definition);
+		const matchingManifests = result.matches.map(({ path }) => displayPath(tree.root, path));
 		return {
-			paths: [manifestPath],
+			confidence: "medium",
+			paths: [definition, ...matchingManifests],
 			evidence: {
 				...evidence,
-				manifest: manifestPath,
-				defined: false,
-				availableScripts: scripts.slice(0, 15),
-				availableScriptCount: scripts.length
+				matchingManifests: matchingManifests.slice(0, 5),
+				workspaceMatchCount: matchingManifests.length,
+				inspectedCount: result.inspectedCount
 			}
 		};
 	}
 };
-const dependencySections = [
-	"dependencies",
-	"devDependencies",
-	"optionalDependencies",
-	"peerDependencies"
+const dependency = {
+	id: "dependency-not-declared",
+	alias: "CD004",
+	kind: "dependency",
+	severity: "warning",
+	description: "Check explicitly named packages against the nearest manifest's dependency sections.",
+	guidance: "Confirm whether this package should be declared here, is provided by another workspace package, or is an external prerequisite.",
+	async check(reference, { file, tree, skip }) {
+		const manifest = await tree.manifest(file);
+		if (!manifest?.data) return skip(manifest?.issue ? "manifest-" + manifest.issue : "manifest-missing", manifest?.path);
+		if (dependencySections.some((section) => Object.hasOwn(manifest.data?.[section] ?? {}, reference.value))) return null;
+		const path = displayPath(tree.root, manifest.path);
+		return {
+			paths: [path],
+			evidence: {
+				package: reference.value,
+				manifest: path,
+				declared: false,
+				checkedSections: dependencySections
+			}
+		};
+	}
+};
+const runtime = {
+	id: "node-version-mismatch",
+	alias: "CD005",
+	kind: "node",
+	severity: "warning",
+	description: "Compare an explicitly mentioned Node.js version with repository pins or engines.node.",
+	guidance: "Confirm which Node.js version the repository intends to use and whether the mention is an instruction or historical context.",
+	async check(reference, { file, tree, skip }) {
+		const manifest = await tree.manifest(file);
+		const pinned = [];
+		for (const directory of tree.ancestors(file)) {
+			for (const name of [".node-version", ".nvmrc"]) {
+				const path = resolve(directory, name);
+				const version = (await tree.read(path))?.split("#")[0].trim();
+				if (version && /^v?\d+(?:\.\d+){0,2}$/.test(version)) pinned.push({
+					path,
+					version
+				});
+			}
+			if (pinned.length) break;
+			const volta = manifest?.data?.volta?.node;
+			if (manifest && directory === dirname(manifest.path) && typeof volta === "string" && validRange(volta)) {
+				pinned.push({
+					path: manifest.path,
+					version: volta
+				});
+				break;
+			}
+		}
+		const engine = manifest?.data?.engines?.node;
+		if (!pinned.length && manifest && typeof engine === "string" && validRange(engine)) pinned.push({
+			path: manifest.path,
+			version: engine
+		});
+		if (!pinned.length) return skip(manifest?.issue ? "manifest-" + manifest.issue : "node-version-evidence-missing", manifest?.path);
+		const incompatible = pinned.filter(({ version }) => !intersects(version, reference.value)).map(({ path, version }) => ({
+			file: displayPath(tree.root, path),
+			version
+		}));
+		if (!incompatible.length) return null;
+		return {
+			paths: incompatible.map(({ file }) => file),
+			confidence: "medium",
+			evidence: {
+				documentedVersion: reference.value,
+				incompatible
+			}
+		};
+	}
+};
+const scriptClaim = {
+	id: "script-mutates-files",
+	alias: "CD008",
+	kind: "script-claim",
+	severity: "error",
+	description: "Check explicit read-only or non-mutating claims against supported linter commands.",
+	guidance: "Confirm the intended behavior, then correct the script or the read-only claim.",
+	async check(reference, { file, tree, markdown, skip, inventory }) {
+		const commands = (await markdown(file))?.references ?? [];
+		const related = commands.filter((command) => command.kind === "script" && command.value === reference.value && (command.npmPrefix !== void 0 || command.workingDirectory !== void 0));
+		if (reference.npmPrefix === void 0 && reference.workingDirectory === void 0 && !related.length && commands.some((command) => command.kind === "workspace-script" && command.value === reference.value)) return skip("workspace-script-claim-unsupported");
+		const locations = reference.npmPrefix !== void 0 || reference.workingDirectory !== void 0 || !related.length ? [reference] : related;
+		const manifests = /* @__PURE__ */ new Map();
+		for (const location of locations) {
+			const { manifests: choices } = await scriptManifests(tree, file, location);
+			if (choices.length !== 1 || !choices[0].data) {
+				const invalid = choices.find((manifest) => manifest.issue);
+				return skip(invalid?.issue ? "manifest-" + invalid.issue : choices.length ? "manifest-ambiguous" : "manifest-missing", invalid?.path);
+			}
+			manifests.set(choices[0].path, choices[0]);
+		}
+		if (manifests.size !== 1) return skip("manifest-ambiguous");
+		const manifest = [...manifests.values()][0];
+		const body = manifest.data?.scripts?.[reference.value];
+		if (typeof body !== "string") return skip("script-body-unavailable", manifest.path);
+		const flag = mutatingLintFlag(body);
+		if (flag === void 0) return skip("lint-command-outside-read-only-check", manifest.path);
+		if (!flag) return null;
+		const path = displayPath(tree.root, manifest.path);
+		return {
+			paths: [path],
+			evidence: {
+				claim: reference.claim,
+				script: reference.value,
+				manifest: path,
+				manifestPointer: "/scripts/" + reference.value,
+				...inventory ? { bodyDigest: createHash("sha256").update(body).digest("hex") } : { body },
+				flag
+			}
+		};
+	}
+};
+const wikiSource = {
+	id: "wiki-source-not-found",
+	alias: "CD007",
+	kind: "wiki-source",
+	severity: "error",
+	description: "Check declared raw source files in a wiki whose configuration documents the raw source convention.",
+	guidance: "Check the wiki's provenance and restore or correct the source reference.",
+	async check(reference, { file, tree, skip }) {
+		if (!reference.value.startsWith("raw/") || reference.value.includes("\0")) return skip("wiki-source-outside-raw-convention");
+		for (const directory of tree.ancestors(file)) {
+			if (displayPath(tree.root, directory).split("/").at(-1) !== "wiki") continue;
+			const config = resolve(directory, "config.md");
+			const contents = await tree.read(config);
+			if (!contents || !/\bsources\b`?[^\r\n]*\bunder[ \t]+`?raw\//i.test(contents)) return skip("wiki-convention-unavailable", config);
+			const raw = resolve(directory, "raw");
+			const target = resolve(directory, reference.value);
+			if (!within(raw, target) || target === raw) return skip("wiki-source-outside-raw-convention");
+			const entry = await tree.locate(target);
+			if (entry?.kind === "file") return null;
+			if (entry?.kind === "other") return skip("wiki-source-target-unavailable", target);
+			const path = displayPath(tree.root, target);
+			const convention = displayPath(tree.root, config);
+			return {
+				paths: [path, convention],
+				evidence: {
+					reference: reference.value,
+					resolvedPath: path,
+					convention
+				}
+			};
+		}
+		return skip("wiki-directory-unavailable");
+	}
+};
+const nodeMinimum = {
+	id: "node-minimum-incompatible",
+	alias: "CD009",
+	kind: "node-minimum",
+	severity: "warning",
+	description: "Check a documented Node.js minimum against the engines of locked direct dependencies.",
+	guidance: "Verify the minimum Node.js version supported by this package and update the guidance.",
+	async check(reference, { file, tree, markdown, packageCandidates, skip }) {
+		const label = reference.packageLabel ?? "";
+		const generic = /^(?:this (?:project|package|repository|repo|workspace)|(?:the )?(?:project|package|repository|repo|workspace))$/i.test(label);
+		const named = generic ? [] : await packageCandidates(label);
+		if (named.length > 1) return skip("manifest-ambiguous");
+		let manifest = named.length === 1 ? await tree.manifestAt(dirname(resolve(tree.root, named[0]))) : null;
+		if (generic) {
+			manifest = await tree.manifest(file);
+			if (!manifest) {
+				const commands = (await markdown(file))?.references ?? [];
+				const prefixes = new Set(commands.filter((command) => command.kind === "script").map((command) => command.npmPrefix));
+				if (prefixes.size === 1 && !prefixes.has(void 0)) {
+					const { manifests } = await scriptManifests(tree, file, { npmPrefix: [...prefixes][0] });
+					if (manifests.length === 1) manifest = manifests[0];
+				}
+			}
+		}
+		if (!manifest?.data) return skip(manifest?.issue ? "manifest-" + manifest.issue : "manifest-missing", manifest?.path);
+		const minimum = minVersion(reference.value);
+		if (!minimum) return skip("invalid-node-minimum");
+		const lock = resolve(dirname(manifest.path), "package-lock.json");
+		const contents = await tree.read(lock);
+		if (contents === null) return skip("npm-lockfile-unavailable", lock);
+		let entries;
+		try {
+			const parsed = JSON.parse(contents);
+			if (!isRecord(parsed) || !isRecord(parsed.packages) || !isRecord(parsed.packages[""])) return skip("npm-lockfile-invalid-shape", lock);
+			entries = parsed.packages;
+		} catch {
+			return skip("npm-lockfile-invalid-json", lock);
+		}
+		const root = entries[""];
+		const incompatible = [];
+		let inspected = 0;
+		let incomplete = false;
+		for (const section of ["dependencies", "devDependencies"]) for (const [name, wanted] of Object.entries(manifest.data[section] ?? {})) {
+			if (Object.hasOwn(manifest.data.optionalDependencies ?? {}, name)) continue;
+			if (root[section]?.[name] !== wanted) {
+				incomplete = true;
+				continue;
+			}
+			const key = "node_modules/" + name;
+			const entry = entries[key];
+			const engine = entry?.engines?.node;
+			if (entry?.optional) continue;
+			if (!isRecord(entry) || engine !== void 0 && (typeof engine !== "string" || !validRange(engine))) {
+				incomplete = true;
+				continue;
+			}
+			if (typeof engine !== "string") continue;
+			inspected++;
+			if (satisfies(minimum, engine)) continue;
+			incompatible.push({
+				name,
+				version: entry.version,
+				engine,
+				lockEntry: key
+			});
+		}
+		if (incomplete) skip("npm-lockfile-incomplete-direct-dependencies", lock);
+		if (!inspected) return skip("no-locked-direct-engine-constraints", lock);
+		if (!incompatible.length) return null;
+		const lockfile = displayPath(tree.root, lock);
+		const manifestPath = displayPath(tree.root, manifest.path);
+		return {
+			confidence: "medium",
+			paths: [lockfile, manifestPath],
+			evidence: {
+				documentedMinimum: minimum.version,
+				manifest: manifestPath,
+				lockfile,
+				incompatible: incompatible.sort((a, b) => a.name.localeCompare(b.name, "en")).slice(0, 10),
+				incompatibleCount: incompatible.length
+			}
+		};
+	}
+};
+const packageManagerVersion = {
+	id: "package-manager-version-mismatch",
+	alias: "CD012",
+	severity: "warning",
+	description: "Compare an exact documented package-manager version with the manifest pin.",
+	guidance: "Confirm the intended version and align the setup guidance with the package manifest."
+};
+const managerLocks = [
+	{
+		manager: "npm",
+		files: ["package-lock.json", "npm-shrinkwrap.json"]
+	},
+	{
+		manager: "pnpm",
+		files: ["pnpm-lock.yaml"]
+	},
+	{
+		manager: "yarn",
+		files: ["yarn.lock"]
+	},
+	{
+		manager: "bun",
+		files: ["bun.lock", "bun.lockb"]
+	}
 ];
 const rules = [
 	link,
 	path,
 	script,
+	workspaceScript,
+	dependency,
+	runtime,
+	wikiSource,
+	scriptClaim,
+	nodeMinimum,
 	{
-		id: "dependency-not-declared",
-		alias: "CD004",
-		kind: "dependency",
+		id: "package-manager-mismatch",
+		alias: "CD011",
+		kind: "package-manager",
 		severity: "warning",
-		description: "Check explicitly named packages against the nearest manifest's dependency sections.",
-		guidance: "Confirm whether this package should be declared here, is provided by another workspace package, or is an external prerequisite.",
-		async check(reference, { file, tree, skip }) {
+		description: "Check an explicit package-manager requirement against the package manifest or lockfile.",
+		guidance: "Check which workflow the declaration applies to and reconcile it with the package configuration.",
+		async check(reference, { file, tree, markdown, containsLockfile, skip }) {
+			if ((await markdown(file))?.historical) return skip("historical-package-manager-claim");
 			const manifest = await tree.manifest(file);
 			if (!manifest?.data) return skip(manifest?.issue ? "manifest-" + manifest.issue : "manifest-missing", manifest?.path);
-			if (dependencySections.some((section) => Object.hasOwn(manifest.data?.[section] ?? {}, reference.value))) return null;
-			const path = displayPath(tree.root, manifest.path);
-			return {
-				paths: [path],
-				evidence: {
-					package: reference.value,
-					manifest: path,
-					declared: false,
-					checkedSections: dependencySections
-				}
+			const manifestPath = displayPath(tree.root, manifest.path);
+			const documentedVersion = reference.version ? valid(reference.version) ?? void 0 : void 0;
+			const evidence = {
+				documentedManager: reference.value,
+				documentedVersion,
+				manifest: manifestPath
 			};
-		}
-	},
-	{
-		id: "node-version-mismatch",
-		alias: "CD005",
-		kind: "node",
-		severity: "warning",
-		description: "Compare an explicitly mentioned Node.js version with repository pins or engines.node.",
-		guidance: "Confirm which Node.js version the repository intends to use and whether the mention is an instruction or historical context.",
-		async check(reference, { file, tree, skip }) {
-			const manifest = await tree.manifest(file);
-			const pinned = [];
-			for (const directory of tree.ancestors(file)) {
-				for (const name of [".node-version", ".nvmrc"]) {
-					const path = resolve(directory, name);
-					const version = (await tree.read(path))?.split("#")[0].trim();
-					if (version && /^v?\d+(?:\.\d+){0,2}$/.test(version)) pinned.push({
-						path,
-						version
-					});
-				}
-				if (pinned.length) break;
-				const volta = manifest?.data?.volta?.node;
-				if (manifest && directory === dirname(manifest.path) && typeof volta === "string" && validRange(volta)) {
-					pinned.push({
-						path: manifest.path,
-						version: volta
-					});
-					break;
-				}
-			}
-			const engine = manifest?.data?.engines?.node;
-			if (!pinned.length && manifest && typeof engine === "string" && validRange(engine)) pinned.push({
-				path: manifest.path,
-				version: engine
-			});
-			if (!pinned.length) return skip(manifest?.issue ? "manifest-" + manifest.issue : "node-version-evidence-missing", manifest?.path);
-			const incompatible = pinned.filter(({ version }) => !intersects(version, reference.value)).map(({ path, version }) => ({
-				file: displayPath(tree.root, path),
-				version
-			}));
-			if (!incompatible.length) return null;
-			return {
-				paths: incompatible.map(({ file }) => file),
-				confidence: "medium",
-				evidence: {
-					documentedVersion: reference.value,
-					incompatible
-				}
-			};
-		}
-	},
-	{
-		id: "wiki-source-not-found",
-		alias: "CD007",
-		kind: "wiki-source",
-		severity: "error",
-		description: "Check declared raw source files in a wiki whose configuration documents the raw source convention.",
-		guidance: "Check the wiki's provenance and restore or correct the source reference.",
-		async check(reference, { file, tree, skip }) {
-			if (!reference.value.startsWith("raw/") || reference.value.includes("\0")) return skip("wiki-source-outside-raw-convention");
-			for (const directory of tree.ancestors(file)) {
-				if (displayPath(tree.root, directory).split("/").at(-1) !== "wiki") continue;
-				const config = resolve(directory, "config.md");
-				const contents = await tree.read(config);
-				if (!contents || !/\bsources\b`?[^\r\n]*\bunder[ \t]+`?raw\//i.test(contents)) return skip("wiki-convention-unavailable", config);
-				const raw = resolve(directory, "raw");
-				const target = resolve(directory, reference.value);
-				if (!within(raw, target) || target === raw) return skip("wiki-source-outside-raw-convention");
-				const entry = await tree.locate(target);
-				if (entry?.kind === "file") return null;
-				if (entry?.kind === "other") return skip("wiki-source-target-unavailable", target);
-				const path = displayPath(tree.root, target);
-				const convention = displayPath(tree.root, config);
-				return {
-					paths: [path, convention],
-					evidence: {
-						reference: reference.value,
-						resolvedPath: path,
-						convention
-					}
+			const pin = manifest.data.packageManager;
+			if (pin !== void 0) {
+				const parsed = typeof pin === "string" ? /^(npm|pnpm|yarn|bun)@(.+)$/.exec(pin) : null;
+				if (!parsed) return skip("package-manager-pin-unsupported", manifest.path);
+				const [, configuredManager, descriptor] = parsed;
+				const configuredVersion = valid(descriptor) ?? void 0;
+				const configured = {
+					...evidence,
+					configuredManager,
+					configuredVersion,
+					manifestPointer: "/packageManager"
+				};
+				const paths = [manifestPath];
+				if (configuredManager !== reference.value) return {
+					paths,
+					evidence: configured
+				};
+				if (!reference.version) return null;
+				if (!documentedVersion || !configuredVersion) return skip("package-manager-version-unavailable", manifest.path);
+				return documentedVersion === configuredVersion ? null : {
+					paths,
+					evidence: configured,
+					diagnostic: packageManagerVersion
 				};
 			}
-			return skip("wiki-directory-unavailable");
-		}
-	},
-	{
-		id: "script-mutates-files",
-		alias: "CD008",
-		kind: "script-claim",
-		severity: "error",
-		description: "Check explicit read-only or non-mutating claims against supported linter commands.",
-		guidance: "Confirm the intended behavior, then correct the script or the read-only claim.",
-		async check(reference, { file, tree, markdown, skip, inventory }) {
-			const related = ((await markdown(file))?.references ?? []).filter((command) => command.kind === "script" && command.value === reference.value && command.npmPrefix !== void 0);
-			const prefixes = reference.npmPrefix !== void 0 ? [reference.npmPrefix] : related.length ? [...new Set(related.map((command) => command.npmPrefix))] : [void 0];
-			const manifests = /* @__PURE__ */ new Map();
-			for (const prefix of prefixes) {
-				const { manifests: choices } = await scriptManifests(tree, file, prefix);
-				if (choices.length !== 1 || !choices[0].data) {
-					const invalid = choices.find((manifest) => manifest.issue);
-					return skip(invalid?.issue ? "manifest-" + invalid.issue : choices.length ? "manifest-ambiguous" : "manifest-missing", invalid?.path);
-				}
-				manifests.set(choices[0].path, choices[0]);
-			}
-			if (manifests.size !== 1) return skip("manifest-ambiguous");
-			const manifest = [...manifests.values()][0];
-			const body = manifest.data?.scripts?.[reference.value];
-			if (typeof body !== "string") return skip("script-body-unavailable", manifest.path);
-			const flag = mutatingLintFlag(body);
-			if (flag === void 0) return skip("lint-command-outside-read-only-check", manifest.path);
-			if (!flag) return null;
-			const path = displayPath(tree.root, manifest.path);
-			return {
-				paths: [path],
-				evidence: {
-					claim: reference.claim,
-					script: reference.value,
-					manifest: path,
-					manifestPointer: "/scripts/" + reference.value,
-					...inventory ? { bodyDigest: createHash("sha256").update(body).digest("hex") } : { body },
-					flag
-				}
-			};
-		}
-	},
-	{
-		id: "node-minimum-incompatible",
-		alias: "CD009",
-		kind: "node-minimum",
-		severity: "warning",
-		description: "Check a documented Node.js minimum against the engines of locked direct dependencies.",
-		guidance: "Verify the minimum Node.js version supported by this package and update the guidance.",
-		async check(reference, { file, tree, markdown, packageCandidates, skip }) {
-			const label = reference.packageLabel ?? "";
-			const generic = /^(?:this (?:project|package|repository|repo|workspace)|(?:the )?(?:project|package|repository|repo|workspace))$/i.test(label);
-			const named = generic ? [] : await packageCandidates(label);
-			if (named.length > 1) return skip("manifest-ambiguous");
-			let manifest = named.length === 1 ? await tree.manifestAt(dirname(resolve(tree.root, named[0]))) : null;
-			if (generic) {
-				manifest = await tree.manifest(file);
-				if (!manifest) {
-					const commands = (await markdown(file))?.references ?? [];
-					const prefixes = new Set(commands.filter((command) => command.kind === "script").map((command) => command.npmPrefix));
-					if (prefixes.size === 1 && !prefixes.has(void 0)) {
-						const { manifests } = await scriptManifests(tree, file, [...prefixes][0]);
-						if (manifests.length === 1) manifest = manifests[0];
-					}
-				}
-			}
-			if (!manifest?.data) return skip(manifest?.issue ? "manifest-" + manifest.issue : "manifest-missing", manifest?.path);
-			const minimum = minVersion(reference.value);
-			if (!minimum) return skip("invalid-node-minimum");
-			const lock = resolve(dirname(manifest.path), "package-lock.json");
-			const contents = await tree.read(lock);
-			if (contents === null) return skip("npm-lockfile-unavailable", lock);
-			let entries;
-			try {
-				const parsed = JSON.parse(contents);
-				if (!isRecord(parsed) || !isRecord(parsed.packages) || !isRecord(parsed.packages[""])) return skip("npm-lockfile-invalid-shape", lock);
-				entries = parsed.packages;
-			} catch {
-				return skip("npm-lockfile-invalid-json", lock);
-			}
-			const root = entries[""];
-			const incompatible = [];
-			let inspected = 0;
-			let incomplete = false;
-			for (const section of ["dependencies", "devDependencies"]) for (const [name, wanted] of Object.entries(manifest.data[section] ?? {})) {
-				if (Object.hasOwn(manifest.data.optionalDependencies ?? {}, name)) continue;
-				if (root[section]?.[name] !== wanted) {
-					incomplete = true;
-					continue;
-				}
-				const key = "node_modules/" + name;
-				const entry = entries[key];
-				const engine = entry?.engines?.node;
-				if (entry?.optional) continue;
-				if (!isRecord(entry) || engine !== void 0 && (typeof engine !== "string" || !validRange(engine))) {
-					incomplete = true;
-					continue;
-				}
-				if (typeof engine !== "string") continue;
-				inspected++;
-				if (satisfies(minimum, engine)) continue;
-				incompatible.push({
-					name,
-					version: entry.version,
-					engine,
-					lockEntry: key
+			const { devEngines } = manifest.data;
+			if (isRecord(devEngines) && Object.hasOwn(devEngines, "packageManager")) return skip("dev-engines-package-manager-unsupported", manifest.path);
+			const locks = [];
+			for (const { manager, files } of managerLocks) for (const file of files) {
+				const path = displayPath(tree.root, resolve(dirname(manifest.path), file));
+				if (await containsLockfile(path)) locks.push({
+					manager,
+					path
 				});
 			}
-			if (incomplete) skip("npm-lockfile-incomplete-direct-dependencies", lock);
-			if (!inspected) return skip("no-locked-direct-engine-constraints", lock);
-			if (!incompatible.length) return null;
-			const lockfile = displayPath(tree.root, lock);
-			const manifestPath = displayPath(tree.root, manifest.path);
+			if (!locks.length) return skip("package-manager-evidence-missing", manifest.path);
+			const configuredManager = locks[0].manager;
+			if (locks.some(({ manager }) => manager !== configuredManager)) return skip("package-manager-lockfiles-ambiguous", manifest.path);
+			if (configuredManager === reference.value) return reference.version ? skip("package-manager-version-unavailable", manifest.path) : null;
+			const lockfiles = locks.map(({ path }) => path);
 			return {
 				confidence: "medium",
-				paths: [lockfile, manifestPath],
+				paths: [manifestPath, ...lockfiles],
 				evidence: {
-					documentedMinimum: minimum.version,
-					manifest: manifestPath,
-					lockfile,
-					incompatible: incompatible.sort((a, b) => a.name.localeCompare(b.name, "en")).slice(0, 10),
-					incompatibleCount: incompatible.length
+					...evidence,
+					configuredManager,
+					lockfiles
 				}
 			};
 		}
 	}
 ];
-const ruleCatalog = [...rules, unknownScriptScope];
+const ruleCatalog = [
+	...rules,
+	unknownScriptScope,
+	unresolvedShorthand,
+	packageManagerVersion
+];
 // src/analysis/scan.ts
 function compare(a, b) {
 	return a < b ? -1 : a > b ? 1 : 0;
 }
-async function scan(repository, changed, options) {
+async function indexEntries(file, root, document, markdown) {
+	const indexes = /* @__PURE__ */ new Map();
+	for (const reference of document.references) {
+		if (reference.kind !== "link" && reference.kind !== "path") continue;
+		const target = localTarget(file, root, reference.value, reference.kind === "link");
+		if (!target || !/^(?:readme|index)\.md$/i.test(basename(target.path))) continue;
+		const paths = [target.path];
+		if (reference.kind === "path" && !/^\.{1,2}\//.test(reference.value)) paths.push(resolve(root, reference.value));
+		for (const path of paths) if (path !== file && !indexes.has(path)) indexes.set(path, {
+			line: reference.line,
+			column: reference.column
+		});
+	}
+	const entries = /* @__PURE__ */ new Map();
+	for (const [index, position] of indexes) {
+		const content = await markdown(index);
+		const added = /* @__PURE__ */ new Set();
+		for (const reference of content?.references ?? []) {
+			if (reference.kind !== "link") continue;
+			const target = localTarget(index, root, reference.value, true);
+			if (!target || dirname(target.path) !== dirname(index) || target.path === index) continue;
+			const name = basename(target.path);
+			if (!isMarkdown(name) || added.has(name)) continue;
+			added.add(name);
+			const matches = entries.get(name) ?? [];
+			matches.push({
+				path: target.path,
+				index,
+				...position
+			});
+			entries.set(name, matches);
+		}
+	}
+	return entries;
+}
+async function scan(repository, changed, options = {}) {
 	const { root, scope } = repository;
 	const tree = new WorkingTree(root);
+	const resolveWorkspace = workspaceResolver(tree, () => packageManifestPaths(repository));
 	const parsed = /* @__PURE__ */ new Map();
 	const markdown = (file) => {
 		let result = parsed.get(file);
 		if (!result) {
-			result = tree.read(file).then((contents) => contents === null ? null : parseMarkdown(contents, Boolean(options)));
+			result = tree.read(file).then((contents) => contents === null ? null : parseMarkdown(contents, options.inventory));
 			parsed.set(file, result);
 		}
 		return result;
 	};
 	let tracked;
+	let trackedEvidence;
+	const containsLockfile = async (path) => {
+		if ((await tree.locate(resolve(root, path)))?.kind !== "file") return false;
+		if (!repository.isGit) return true;
+		tracked ??= trackedPaths(repository);
+		trackedEvidence ??= new Set(await tracked);
+		return trackedEvidence.has(path);
+	};
 	const ignored = /* @__PURE__ */ new Map();
 	const ignoredAtRoot = (path) => {
 		let result = ignored.get(path);
@@ -1208,8 +1754,8 @@ async function scan(repository, changed, options) {
 		}
 		return matches;
 	};
-	const discovery = await discover(repository, Boolean(options));
-	const queue = new Set(discovery.selected);
+	const discovery = await discover(repository, options);
+	const queue = new Set(discovery.selected.keys());
 	const inventory = /* @__PURE__ */ new Map();
 	const addDocument = (file, via, depth) => {
 		const path = displayPath(root, file);
@@ -1228,13 +1774,13 @@ async function scan(repository, changed, options) {
 			checks: {},
 			limitations: {}
 		};
-		if (via === "observed-convention") note(document, { reason: "convention-observed-only" });
+		if (via === "observed-convention") note(document, { reason: options.includeObserved && !isMarkdown(file) ? "unsupported-context-format" : "convention-observed-only" });
 		inventory.set(file, document);
 		return document;
 	};
-	if (options) {
+	if (options.inventory) {
 		for (const file of discovery.other) addDocument(file, "observed-convention", null);
-		for (const file of discovery.selected) addDocument(file, file === scope ? "explicit-file" : "default-entry", 0);
+		for (const [file, source] of discovery.selected) addDocument(file, source, 0);
 	}
 	const findings = [];
 	const repeatedPaths = /* @__PURE__ */ new Map();
@@ -1245,6 +1791,13 @@ async function scan(repository, changed, options) {
 		const record = inventory.get(file);
 		let document;
 		try {
+			if (discovery.selected.get(file) === "included-convention") {
+				const location = await tree.locate(file);
+				if (location?.kind === "file" && (!within(scope, location.path) || !isMarkdown(location.path))) {
+					if (record) note(record, { reason: "included-file-target-outside-scope-or-format" });
+					continue;
+				}
+			}
 			document = await markdown(file);
 		} catch (error) {
 			if (!record || !["EACCES", "EPERM"].includes(error.code ?? "")) throw error;
@@ -1257,6 +1810,12 @@ async function scan(repository, changed, options) {
 		}
 		const successful = /* @__PURE__ */ new Map();
 		const duplicateChecks = /* @__PURE__ */ new Set();
+		let indexed;
+		const indexedPath = async (name, line, column) => {
+			indexed ??= indexEntries(file, root, document, markdown);
+			const matches = (await indexed).get(name)?.filter((entry) => entry.line < line || entry.line === line && entry.column < column);
+			return matches?.length === 1 ? matches[0] : void 0;
+		};
 		if (record) {
 			record.status = "analysed";
 			record.measurements = document.measurements;
@@ -1303,6 +1862,9 @@ async function scan(repository, changed, options) {
 				markdown,
 				pathCandidates,
 				packageCandidates,
+				containsLockfile,
+				resolveWorkspace,
+				indexedPath,
 				isIgnored: ignoredAtRoot,
 				inventory: Boolean(record),
 				skip
@@ -1310,7 +1872,7 @@ async function scan(repository, changed, options) {
 				if (!record || !["EACCES", "EPERM"].includes(error.code ?? "")) throw error;
 				return skip("reference-evidence-unreadable");
 			});
-			const checkKey = options?.snapshot ? referenceKey(reference) : void 0;
+			const checkKey = options.snapshot ? referenceKey(reference) : void 0;
 			if (record) {
 				const coverage = record.checks[reference.kind] ?? {
 					examined: 0,
@@ -1335,6 +1897,9 @@ async function scan(repository, changed, options) {
 				if (reference.npmPrefix !== void 0) {
 					context = "prefix:" + reference.npmPrefix;
 					reason = "Shared npm prefix " + reference.npmPrefix;
+				} else if (reference.workingDirectory !== void 0) {
+					context = "directory:" + reference.workingDirectory;
+					reason = "Shared working directory " + reference.workingDirectory;
 				} else if (reference.packageRow?.label) {
 					context = "row:" + reference.packageRow.line;
 					reason = "Shared package row for " + reference.packageRow.label;
@@ -1343,6 +1908,9 @@ async function scan(repository, changed, options) {
 				if (document.historical) {
 					context = "snapshot";
 					reason = document.historical.revision ? "Immutable snapshot at " + document.historical.revision : "Immutable snapshot";
+				} else if (typeof result.evidence.documentIndex === "string") {
+					context = "document-index:" + result.evidence.documentIndex;
+					reason = "Shared documentation index " + result.evidence.documentIndex;
 				} else if (result.candidates?.length === 1) {
 					const suffix = reference.value.replace(/\/$/, "");
 					const prefix = result.candidates[0].slice(0, -suffix.length - 1);
@@ -1377,7 +1945,7 @@ async function scan(repository, changed, options) {
 				repeatedPaths.set(key, occurrences);
 			}
 		}
-		if (record && options?.snapshot) {
+		if (record && options.snapshot) {
 			record.successfulChecks = [...successful].filter(([, passed]) => passed).map(([key]) => key).sort();
 			record.duplicateChecks = [...duplicateChecks].sort();
 		}
@@ -1394,6 +1962,7 @@ async function scan(repository, changed, options) {
 	return {
 		documents,
 		findings,
+		selection: discovery.selection,
 		inventory: [...inventory.values()].sort((a, b) => compare(a.path, b.path))
 	};
 }
@@ -1405,11 +1974,15 @@ function observation({ rule, evidence }) {
 	switch (rule) {
 		case "broken-markdown-link": return evidence.anchorExists === false ? "Heading anchor #" + printable(evidence.fragment) + " is missing in " + printable(evidence.resolvedPath) : "Link destination is missing: " + printable(evidence.resolvedPath);
 		case "wiki-source-not-found": return "Wiki source is missing: " + printable(evidence.resolvedPath);
-		case "reference-not-found": return evidence.exists === true ? "Expected a directory at " + printable(evidence.resolvedPath) : "Referenced path is missing: " + printable(evidence.resolvedPath);
+		case "reference-not-found": return evidence.exists === true ? "Expected a " + printable(evidence.expectedKind ?? "directory") + " at " + printable(evidence.resolvedPath) : "Referenced path is missing: " + printable(evidence.resolvedPath);
 		case "script-scope-unknown": return "Could not establish the package for script " + printable(evidence.script);
+		case "workspace-target-unresolved": return evidence.workspaceMatchCount === 0 ? "Workspace " + printable(evidence.workspace) + " was not found under " + printable(evidence.workspaceDefinition) : "Workspace " + printable(evidence.workspace) + " matches multiple manifests under " + printable(evidence.workspaceDefinition);
 		case "script-mutates-files": return "Script " + printable(evidence.script) + " uses " + printable(evidence.flag) + " in " + printable(evidence.manifest);
-		case "script-not-defined": return "Script " + printable(evidence.script) + (evidence.manifest ? " is missing from " + printable(evidence.manifest) : " has no package.json in scope");
+		case "script-not-defined":
+		case "script-shorthand-unresolved": return "Script " + printable(evidence.script) + (evidence.manifest ? " is missing from " + printable(evidence.manifest) : " has no package.json in scope");
 		case "dependency-not-declared": return "Package " + printable(evidence.package) + " is undeclared in " + printable(evidence.manifest);
+		case "package-manager-mismatch": return "Documented package manager " + printable(evidence.documentedManager) + " differs from " + printable(evidence.configuredManager) + " in " + (Array.isArray(evidence.lockfiles) ? evidence.lockfiles.map(printable).join(", ") : printable(evidence.manifest));
+		case "package-manager-version-mismatch": return "Documented " + printable(evidence.documentedManager) + " " + printable(evidence.documentedVersion) + " differs from " + printable(evidence.configuredVersion) + " in " + printable(evidence.manifest);
 		case "node-minimum-incompatible": return "Documented Node.js minimum " + printable(evidence.documentedMinimum) + " conflicts with locked dependencies in " + printable(evidence.lockfile);
 		case "node-version-mismatch": return "Documented Node.js " + printable(evidence.documentedVersion) + " is incompatible with " + evidence.incompatible.map(({ file, version }) => printable(file) + " (" + printable(version) + ")").join(", ");
 		default: return rule;
@@ -1437,6 +2010,7 @@ function formatText(report) {
 	}
 	if (findings.length) lines.push("");
 	lines.push(summary.documents + " documents scanned · " + summary.errors + " errors · " + summary.warnings + " warnings");
+	if (!summary.documents) lines.push("No guidance was examined. Use --inventory to inspect coverage or --entry to add a guide.");
 	if (page.nextOffset !== null) lines.push("More findings available with --offset " + page.nextOffset + ".");
 	return lines.join("\n");
 }
@@ -1453,6 +2027,8 @@ Scan options
   --json                 Emit the versioned JSON report
   --format <json|text>   Select the output format
   --path <path>          Scan a directory or a Markdown file
+  --entry <file>         Add a repository-relative Markdown entry point (repeatable)
+  --include-observed     Include recognised Markdown guidance found in inventory
   --changed              Show findings whose sources or evidence changed
   --base <ref>           Compare with this ref's merge base (requires --changed)
   --severity <level>     Minimum severity, warning or error (default warning)
@@ -1487,6 +2063,11 @@ async function main(args) {
 	};
 	const scanOptions = {
 		path: { type: "string" },
+		entry: {
+			type: "string",
+			multiple: true
+		},
+		"include-observed": { type: "boolean" },
 		changed: { type: "boolean" },
 		base: { type: "string" },
 		severity: { type: "string" },
@@ -1545,7 +2126,12 @@ async function main(args) {
 	const offset = integer(values.offset, 0, "offset", 0, Number.MAX_SAFE_INTEGER);
 	const repository = await openRepository(process.cwd(), values.path ?? positionals[0]);
 	const changed = values.changed ? await changes(repository, values.base) : null;
-	const { documents, findings, inventory } = await scan(repository, changed?.paths, values.inventory ? { snapshot: Boolean(values.all) } : void 0);
+	const { documents, findings, inventory, selection } = await scan(repository, changed?.paths, {
+		inventory: values.inventory,
+		snapshot: values.inventory && values.all,
+		entries: values.entry,
+		includeObserved: values["include-observed"]
+	});
 	const filtered = values.severity === "error" ? findings.filter(({ severity }) => severity === "error") : findings;
 	const errors = filtered.filter(({ severity }) => severity === "error").length;
 	const report = {
@@ -1553,7 +2139,8 @@ async function main(args) {
 		scope: {
 			path: displayPath(repository.root, repository.scope),
 			changed: Boolean(changed),
-			base: changed?.base ?? null
+			base: changed?.base ?? null,
+			...selection ? { selection } : {}
 		},
 		summary: {
 			documents,

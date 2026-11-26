@@ -21,6 +21,8 @@ Establish the target checkout, requested paths, relevant agent and task if known
 
 Exit 0 and exit 1 are completed scans. On exit 2, inspect stderr and fix the invocation or explain the resulting coverage limit. Follow `page.nextOffset` for paged results or capture a single full report with `--all`. Redirect complete snapshots to a temporary file outside the checkout and inspect only the summary and relevant records.
 
+When the inventory leaves task-relevant guidance unexamined or reports zero documents, see [context architecture](references/context-architecture.md) for selecting additional entry points. Use the same selection when capturing a baseline and verifying a fix.
+
 ## Diagnose, investigate and propose
 
 1. Start with the scan’s scope, document statuses and limitations. Locate the authoritative claim, real repository evidence and affected workflow before treating a finding as a defect.

@@ -12,6 +12,8 @@ Read this for comprehensive assessment, nested instructions, branch scope or an 
 ## Interpret the inventory
 
 - A default entry is a Context Doctor discovery result for a familiar basename. A file found through a local link is reachable from a selected document. An observed-only file matches an additional convention and was not analysed.
+- When an observed Markdown convention matters to the task, use `--include-observed` within the relevant directory or add the specific repository-relative file with `--entry`. Repeat `--entry` to cover named contributor guides when default discovery is sparse. These options add entry points and allow links to be followed within the scan scope. For a single document, use `--path`.
+- Inspect `scope.selection`, document statuses and unsupported formats after changing the entry points. A file selected through either option is still evidence about repository content. Its metadata and loader applicability need separate corroboration.
 - Directory is the containing directory. Depth is the first local-link route from a selected entry. Neither describes instruction precedence. Links are structural edges, while the inclusion decision depends on scope, the loader and the task.
 - Read the document status, per-kind checks and limitation counts before interpreting totals. Some syntax never becomes a parsed reference. Absence of a check counter means that the scanner emitted no candidate of that kind in the document.
 - Under Git, discovery uses the tracked index and non-ignored untracked files. A local Markdown link can still reach an ignored file. In a filesystem walk, inspect scope and conventional directory exclusions before comparing coverage with a Git scan.
